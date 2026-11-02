@@ -1,0 +1,11 @@
+AGENTS.md
+.codex/*
+dist/
+evals/codex-paired/runs/
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+.claude/
+__pycache__/
+*.pyc
