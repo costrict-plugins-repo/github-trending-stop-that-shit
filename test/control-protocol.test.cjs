@@ -1,0 +1,1147 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+const { fromControlResult, handleCodexHook, toControlEvent } = require('../src/adapters/codex-hooks.cjs');
+const { assertControlEvent, PROTOCOL_VERSION, SHELL_ANALYSIS_REASONS } = require('../src/control-protocol.cjs');
+const { handleControlEvent } = require('../src/controller.cjs');
+const { detectDependencyIntent } = require('../src/adapters/codex-tool-classifier.cjs');
+const { readRuntime } = require('../src/runtime-audit.cjs');
+const { childStatePath, readState } = require('../src/state.cjs');
+
+function dataDir(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sts-protocol-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  return directory;
+}
+
+test('status exposes effective constraints and denials explain the conflicting facts without leaking them to audit', t => {
+  const directory = dataDir(t);
+  const call = (kind, fields) => handleControlEvent({ protocolVersion: PROTOCOL_VERSION, sessionId: 'diagnosis', kind, ...fields }, { dataDir: directory });
+  call('prompt.submit', { prompt: '$stop-that-shit change agents=1 files=src/** deps=deny hash=deny' });
+  const status = call('prompt.submit', { prompt: '$stop-that-shit status' });
+  for (const value of ['files=src/**', 'agents=0/1', 'deps=deny', 'hash=deny']) assert.ok(status.text.includes(value), value);
+  const denied = call('action.before', { action: { id: 'outside', name: 'write', mutability: 'write', affectedPaths: ['other/secret.txt'] } });
+  assert.match(denied.message, /other\/secret.txt/);
+  assert.doesNotMatch(JSON.stringify(readRuntime({}, { dataDir: directory })), /other\/secret.txt/);
+  const allowed = call('action.before', { action: { id: 'inside', name: 'write', mutability: 'write', affectedPaths: ['src/a.txt'] } });
+  assert.equal(allowed.kind, 'none');
+});
+
+test('prototype-named action IDs survive persistence, enforce capacity and remain deduplicated', t => {
+  const directory = dataDir(t);
+  const call = (kind, fields) => handleControlEvent({
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'prototype-id', kind, ...fields
+  }, { dataDir: directory });
+  call('prompt.submit', { prompt: '$stop-that-shit change agents=1' });
+  const launch = id => call('action.before', {
+    action: { id, name: 'Agent', mutability: 'delegate', delegationCount: 1 }
+  });
+  assert.equal(launch('__proto__').kind, 'none');
+  assert.equal(readState('prototype-id', directory).storageError, undefined);
+  assert.equal(launch('next').decision.reasonCode, 'AGENT_BUDGET_EXHAUSTED');
+  call('action.after', { action: { id: '__proto__', lifecycle: 'joined' } });
+  assert.equal(launch('__proto__').decision.reasonCode, 'DUPLICATE_ACTION_ID');
+  assert.equal(launch('next').kind, 'none');
+});
+
+test('damaged control state retains its evidence and offers read-only recovery instead of fresh authority', t => {
+  const directory = dataDir(t);
+  const { statePath } = require('../src/state.cjs');
+  const call = (kind, fields) => handleControlEvent({ protocolVersion: PROTOCOL_VERSION, sessionId: 'damaged', kind, ...fields }, { dataDir: directory });
+  call('prompt.submit', { prompt: '$stop-that-shit change agents=1' });
+  const file = statePath('damaged', directory);
+  fs.writeFileSync(file, '{partial');
+  const status = call('prompt.submit', { prompt: '$stop-that-shit status' }).text;
+  assert.match(status, /STATE_DAMAGED/);
+  assert.match(status, /count unproven/);
+  assert.match(status, /Unresolved activity: state_unavailable/);
+  assert.equal(call('action.before', { action: { id: 'read', name: 'read', mutability: 'read' } }).kind, 'none');
+  const blocked = call('action.before', { action: { id: 'write', name: 'write', mutability: 'write' } });
+  assert.match(blocked.message, /STATE_DAMAGED/);
+  call('prompt.submit', { prompt: '$stop-that-shit change' });
+  assert.equal(fs.readFileSync(file, 'utf8'), '{partial');
+  const fresh = handleControlEvent({ protocolVersion: PROTOCOL_VERSION, kind: 'prompt.submit', sessionId: 'new-session', prompt: '$stop-that-shit change' }, { dataDir: directory });
+  assert.match(fresh.text, /mode=change/);
+});
+
+test('invalid saved contract fields enter recovery without replacing the original file', t => {
+  const directory = dataDir(t);
+  const { freshState, statePath } = require('../src/state.cjs');
+  for (const [field, value] of [['mode', 42], ['level', 'invalid'], ['agentBudget', -1], ['hashPolicy', []], ['dependencyPolicy', 'maybe'], ['allowedPaths', 'src/**']]) {
+    const state = freshState();
+    state.contract[field] = value;
+    const file = statePath(field, directory);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const raw = JSON.stringify(state);
+    fs.writeFileSync(file, raw);
+    const result = handleControlEvent({ protocolVersion: PROTOCOL_VERSION, kind: 'action.before', sessionId: field, action: { id: 'write', name: 'write', mutability: 'write' } }, { dataDir: directory });
+    assert.match(result.message, /STATE_DAMAGED/, field);
+    assert.equal(fs.readFileSync(file, 'utf8'), raw);
+  }
+});
+
+test('a damaged legacy lock before the first contract preserves evidence and permits a new session', t => {
+  const directory = dataDir(t);
+  const { statePath } = require('../src/state.cjs');
+  const call = (sessionId, kind, fields) => handleControlEvent({
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId, kind, ...fields
+  }, { dataDir: directory });
+  const file = statePath('legacy-empty', directory);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const lock = `${file}.lock`;
+  fs.writeFileSync(lock, '');
+  const old = new Date(Date.now() - 20000);
+  fs.utimesSync(lock, old, old);
+  assert.match(call('legacy-empty', 'prompt.submit', { prompt: '$stop-that-shit guard review' }).text, /STS_LOCK_DAMAGED/);
+  assert.equal(call('legacy-empty', 'action.before', { action: { name: 'write', mutability: 'write' } }).kind, 'deny');
+  assert.equal(call('legacy-empty', 'action.before', { action: { name: 'read', mutability: 'read' } }).kind, 'none');
+  assert.equal(fs.existsSync(file), false);
+  assert.equal(fs.readFileSync(lock, 'utf8'), '');
+  assert.match(call('new-session', 'prompt.submit', { prompt: '$stop-that-shit guard change' }).text, /mode=change/);
+  assert.equal(call('new-session', 'action.before', { action: { name: 'write', mutability: 'write' } }).kind, 'none');
+});
+
+for (const level of ['guard', 'watch', 'off']) {
+  test(`a damaged legacy lock keeps ${level} state intact and blocks fresh writes until recovery`, t => {
+    const directory = dataDir(t);
+    const { statePath } = require('../src/state.cjs');
+    const call = (kind, fields) => handleControlEvent({
+      protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'legacy', kind, ...fields
+    }, { dataDir: directory });
+    call('prompt.submit', { prompt: `$stop-that-shit ${level} change agents=1` });
+    call('action.before', { action: { id: 'active', name: 'agent', mutability: 'delegate', delegationCount: 1 } });
+    const file = statePath('legacy', directory);
+    const before = fs.readFileSync(file, 'utf8');
+    const savedDelegation = readState('legacy', directory).delegation;
+    const lock = `${file}.lock`;
+    fs.writeFileSync(lock, '');
+    const old = new Date(Date.now() - 20000);
+    fs.utimesSync(lock, old, old);
+
+    assert.match(call('prompt.submit', { prompt: '$stop-that-shit review guard' }).text, /STS_LOCK_DAMAGED/);
+    assert.match(call('prompt.submit', { prompt: '$stop-that-shit status' }).text, /STS_LOCK_DAMAGED/);
+    assert.match(call('session.start', {}).text, /STS_LOCK_DAMAGED/);
+    assert.equal(call('action.before', { action: { name: 'read', mutability: 'read' } }).kind, 'none');
+    for (const mutability of ['write', 'delegate']) {
+      const result = call('action.before', { action: { id: 'blocked', name: mutability, mutability } });
+      assert.equal(result.kind, 'deny');
+      assert.equal(result.decision.reasonCode, 'STS_LOCK_DAMAGED');
+      assert.match(result.message, /stop every host process/i);
+      assert.doesNotMatch(result.decision.nextStep, /restore.*state.*backup/i);
+    }
+    assert.equal(fs.readFileSync(file, 'utf8'), before);
+    assert.equal(fs.readFileSync(lock, 'utf8'), '');
+
+    // This fixture has no host writers. Quarantine only its damaged lock.
+    fs.renameSync(lock, `${lock}.quarantine`);
+    assert.deepEqual(readState('legacy', directory).delegation, savedDelegation);
+    assert.match(call('prompt.submit', { prompt: '$stop-that-shit guard review' }).text, /mode=review/);
+    assert.equal(call('action.before', { action: { name: 'write', mutability: 'write' } }).decision.reasonCode, 'MODE_FORBIDS_MUTATION');
+    assert.match(call('prompt.submit', { prompt: '$stop-that-shit guard change' }).text, /mode=change/);
+    assert.equal(call('action.before', { action: { name: 'write', mutability: 'write' } }).kind, 'none');
+    assert.deepEqual(readState('legacy', directory).delegation, savedDelegation);
+  });
+}
+
+test('shell analysis reasons accept only optional fixed string codes', () => {
+  const event = {
+    protocolVersion: PROTOCOL_VERSION, kind: 'action.before', sessionId: 'reason-session',
+    action: { name: 'Bash', mutability: 'unknown' }
+  };
+  assert.doesNotThrow(() => assertControlEvent(event));
+  for (const analysisReason of Object.keys(SHELL_ANALYSIS_REASONS)) {
+    assert.doesNotThrow(() => assertControlEvent({ ...event, action: { ...event.action, analysisReason } }));
+  }
+  for (const analysisReason of ['PRIVATE_COMMAND', 'toString', null, 1, ['shell_execution_option'], { toString: () => 'shell_execution_option' }]) {
+    assert.throws(() => assertControlEvent({ ...event, action: { ...event.action, analysisReason } }), /Unsupported action analysis reason/);
+  }
+});
+
+test('all seven shell adapters preserve paired argument facts and available diagnostic reasons', t => {
+  const claude = require('../src/adapters/claude-hooks.cjs');
+  const dsh = require('../src/adapters/dsh-hooks.cjs');
+  const hermes = require('../src/adapters/hermes-hooks.cjs');
+  const omp = require('../src/adapters/omp-hooks.cjs');
+  const opencode = require('../src/adapters/opencode-hooks.cjs');
+  const pi = require('../src/adapters/pi-hooks.cjs');
+  const hook = (name, command) => ({
+    session_id: 'analysis-session', hook_event_name: 'PreToolUse', tool_name: name, tool_input: { command }
+  });
+  const adapters = [
+    ...['Bash', 'exec_command', 'shell_command'].map(name => [name, command => toControlEvent(hook(name, command))]),
+    ...['Bash', 'PowerShell', 'Monitor'].map(name => [`Claude ${name}`, command => claude.toControlEvent(hook(name, command))]),
+    ...['bash', 'pwsh'].map(name => [`DSH ${name}`, command => dsh.toControlEvent('tools/pre-execute',
+      dsh.fromNativeEvent('tools/pre-execute', {
+        name, arguments: { command }, callId: 'analysis-call',
+        agent: { session: { id: 'analysis-session', header: { cwd: '/repo' } } }
+      }))]),
+    ['Hermes terminal', command => hermes.toControlEvent({ ...hook('terminal', command), hook_event_name: 'pre_tool_call' })],
+    ['OpenCode bash', command => opencode.toActionEvent({ tool: 'bash', sessionID: 'analysis-session' }, { args: { command } })],
+    ...['bash', 'powershell'].map(name => [`Pi ${name}`, command => pi.toActionEvent({ toolName: name, input: { command } }, { sessionId: 'analysis-session' })])
+  ];
+  // OMP has no exported event translator. Exercise its real handler and inspect
+  // the recorded facts instead of constructing a synthetic ControlEvent.
+  const options = { dataDir: dataDir(t), now: () => new Date('2026-01-01T00:00:00Z') };
+  const ompAdapters = ['bash', 'powershell'].map(name => {
+    const context = { sessionId: `analysis-omp-${name}`, cwd: '/repo' };
+    omp.handleOmpPrompt({ text: '$stop-that-shit guard review hash=deny deps=deny' }, context, options);
+    return [name, context];
+  });
+  assert.deepEqual([...adapters.map(([name]) => name), ...ompAdapters.map(([name]) => `OMP ${name}`)], [
+    'Bash', 'exec_command', 'shell_command', 'Claude Bash', 'Claude PowerShell', 'Claude Monitor',
+    'DSH bash', 'DSH pwsh', 'Hermes terminal', 'OpenCode bash', 'Pi bash', 'Pi powershell',
+    'OMP bash', 'OMP powershell'
+  ]);
+  const cases = [
+    ['git status', 'read'],
+    ["rg -n 'npm install' README.md", 'read'],
+    ["rg 'Get-FileHash' README.md; rg 'sha256sum' README.md", 'read'],
+    ['git diff --word-diff-regex -- -- README.md', 'read'],
+    ['git diff -- --output=tracked.txt', 'read'],
+    ["rg -e '--hostname-bin=helper' README.md", 'read'],
+    ["rg '' README.md", 'read'],
+    ['Get-FileHash README.md', 'unknown', 'shell_command_unproven', true],
+    ['git status; npm install example-package', 'write', undefined, false, true],
+    ['git diff --output=marker.txt', 'write', 'git_output_file'],
+    ['git diff --word-diff-regex -- --output=marker.txt', 'write', 'git_output_file'],
+    ['rg --hostname-bin=helper fixture input.txt', 'unknown', 'shell_execution_option'],
+    ["rg -e '' -- --hostname-bin=helper input.txt", 'unknown', 'native_empty_arguments'],
+    ['git show --future-option', 'unknown', 'git_arguments_unproven'],
+    ['rg -e', 'unknown', 'option_value_missing'],
+    ['git diff --src-prefix', 'unknown', 'option_value_missing'],
+    ["rg 'unfinished", 'unknown', 'shell_syntax_unproven'],
+    ["rg 'a\"b' README.md", 'unknown', 'native_quotes_unproven'],
+    ['git status > marker.txt', 'write', 'shell_redirection']
+  ];
+  for (const [index, [command, mutability, analysisReason, hashIntent = false, dependencyIntent = false]] of cases.entries()) {
+    for (const [adapter, translate] of adapters) {
+      const event = translate(command);
+      assertControlEvent(event);
+      const actual = Object.fromEntries(['mutability', 'analysisReason', 'hashIntent', 'dependencyIntent'].map(key => [key, event.action[key]]));
+      assert.deepEqual(actual, { mutability, analysisReason, hashIntent, dependencyIntent }, `${adapter}: ${command}`);
+    }
+    for (const [toolName, context] of ompAdapters) {
+      const label = `OMP ${toolName}: ${command}`;
+      const result = omp.handleOmpTool({
+        type: 'tool_call', toolCallId: `analysis-${index}`, toolName, input: { command }
+      }, context, options);
+      assert.equal(result.kind, mutability === 'read' ? 'none' : 'deny', label);
+      if (mutability !== 'read') {
+        assert.equal(result.decision.reasonCode,
+          mutability === 'write' ? 'MODE_FORBIDS_MUTATION' : 'MUTABILITY_UNPROVEN', label);
+      }
+      const runtime = readRuntime({ sessionId: context.sessionId }, options);
+      assert.equal(runtime.events.length, index + 1, label);
+      const recorded = runtime.events.at(-1);
+      const actual = Object.fromEntries(['mutability', 'hashIntent', 'dependencyIntent'].map(key => [key, recorded.action[key]]));
+      assert.deepEqual(actual, { mutability, hashIntent, dependencyIntent }, label);
+      // OMP currently omits this optional diagnostic. Preserve that limitation
+      // rather than changing policy or claiming diagnostic parity with it.
+      assert.equal(Object.hasOwn(recorded.action, 'analysisReason'), false, label);
+      assert.equal(recorded.decision.responseOutcome,
+        mutability === 'read' ? 'none' : 'execution_denial_returned', label);
+      assert.equal(recorded.decision.hostEffect, 'unobserved', label);
+    }
+  }
+});
+
+test('OMP shell gates preserve paired reads and allow the requested result after explicit authority', t => {
+  const { handleOmpPrompt, handleOmpTool } = require('../src/adapters/omp-hooks.cjs');
+  const options = { dataDir: dataDir(t) };
+  for (const toolName of ['bash', 'powershell']) {
+    const context = { sessionId: `paired-omp-${toolName}`, cwd: '/repo' };
+    const prompt = text => handleOmpPrompt({ text }, context, options);
+    const call = (id, command) => handleOmpTool({
+      type: 'tool_call', toolCallId: id, toolName, input: { command }
+    }, context, options);
+    prompt('$stop-that-shit guard change hash=deny deps=deny');
+    const pairs = [
+      ['hash', 'Get-FileHash README.md', "rg 'Get-FileHash' README.md", 'HASH_NOT_AUTHORIZED'],
+      ['dependency', 'git status; npm install example-package', "rg -n 'npm install' README.md", 'DEPENDENCY_NOT_AUTHORIZED']
+    ];
+    for (const [id, blocked, read, reason] of pairs) {
+      const result = call(`${id}-denied`, blocked);
+      assert.equal(result.kind, 'deny', `${toolName}: ${blocked}`);
+      assert.equal(result.decision.reasonCode, reason, `${toolName}: ${blocked}`);
+      assert.equal(call(`${id}-read`, read).kind, 'none', `${toolName}: ${read}`);
+    }
+    prompt('$stop-that-shit guard change hash=allow deps=allow');
+    for (const [id, command] of pairs) {
+      assert.equal(call(`${id}-authorized`, command).kind, 'none', `${toolName}: ${command}`);
+    }
+    assert.equal(call('requested-output', 'git diff --output=marker.txt').kind, 'none', toolName);
+    assert.equal(call('final-read', 'git status').kind, 'none', toolName);
+  }
+});
+
+test('Codex Adapter maps Hook JSON to ControlEvent v2', () => {
+  const event = toControlEvent({
+    session_id: 'session-1',
+    turn_id: 'turn-1',
+    hook_event_name: 'PreToolUse',
+    tool_name: 'apply_patch',
+    tool_use_id: 'call-1',
+    tool_input: { command: 'patch' },
+    model: 'gpt-example'
+  });
+  assert.equal(event.protocolVersion, PROTOCOL_VERSION);
+  assert.equal(event.kind, 'action.before');
+  assert.equal(event.action.mutability, 'write');
+  assert.equal(event.action.hashIntent, false);
+  assert.equal(event.host.model, 'gpt-example');
+  assertControlEvent(event);
+});
+
+test('Codex Adapter maps lifecycle Hook fields to ControlEvent v2', () => {
+  const after = toControlEvent({
+    session_id: 'lifecycle-session',
+    hook_event_name: 'PostToolUse',
+    tool_use_id: 'call-1',
+    tool_name: 'Agent',
+    tool_input: { prompt: 'inspect' }
+  });
+  assert.equal(after.kind, 'action.after');
+  assert.deepEqual(after.action, { id: 'call-1', lifecycle: 'unknown' });
+
+  const start = toControlEvent({
+    session_id: 'lifecycle-session',
+    hook_event_name: 'SubagentStart',
+    agent_id: 'agent-1',
+    reservation_id: 'reservation:call-1'
+  });
+  assert.equal(start, null);
+
+  const stop = toControlEvent({
+    session_id: 'lifecycle-session',
+    hook_event_name: 'SubagentStop',
+    agent_id: 'agent-1'
+  });
+  assert.equal(stop, null);
+
+  const end = toControlEvent({
+    session_id: 'lifecycle-session',
+    hook_event_name: 'SessionEnd',
+    reason: 'other'
+  });
+  assert.equal(end.kind, 'session.end');
+  for (const hookEventName of ['PostToolUse', 'SubagentStop', 'SessionEnd']) {
+    assert.equal(fromControlResult(hookEventName, { kind: 'context', text: 'observer context' }), null);
+  }
+});
+
+test('Codex ignores PostToolUse events without a valid action identifier', () => {
+  for (const identifier of [undefined, null, '', '   ', 42]) {
+    const input = {
+      session_id: 'malformed-after',
+      hook_event_name: 'PostToolUse',
+      tool_use_id: identifier
+    };
+    assert.equal(toControlEvent(input), null);
+    assert.equal(handleCodexHook(input), null);
+  }
+
+  const fallback = toControlEvent({
+    session_id: 'fallback-after',
+    hook_event_name: 'PostToolUse',
+    tool_name: 'spawn_agent',
+    tool_use_id: 42,
+    tool_call_id: 'fallback-call'
+  });
+  assert.equal(fallback.action.id, 'fallback-call');
+});
+
+test('Codex prompt hooks reject split directives and accept formal agents syntax', (t) => {
+  const directory = dataDir(t);
+  handleCodexHook({
+    session_id: 'invalid-directive',
+    hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit change total-agents=4 -- bounded delegation'
+  }, { dataDir: directory });
+  const output = handleCodexHook({
+    session_id: 'invalid-directive',
+    hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit change agents=1 -- set concurrency'
+  }, { dataDir: directory });
+  assert.match(output.hookSpecificOutput.additionalContext, /agents=0\/1/);
+  assert.equal(readState('invalid-directive', directory).contract.agentBudget, 1);
+  assert.equal(readState('invalid-directive', directory).directiveError, null);
+  assert.equal(readState('invalid-directive', directory).directiveWarning, null);
+  assert.deepEqual(fromControlResult('UserPromptSubmit', {
+    kind: 'prompt-error',
+    message: 'invalid prompt'
+  }), { decision: 'block', reason: 'invalid prompt' });
+});
+
+test('Codex subagent prompts create an independent inherited contract', (t) => {
+  const directory = dataDir(t);
+  const parent = {
+    session_id: 'parent-session',
+    hook_event_name: 'UserPromptSubmit'
+  };
+  handleCodexHook({
+    ...parent,
+    prompt: '$stop-that-shit change agents=6 files=src/** -- parent task'
+  }, { dataDir: directory });
+
+  handleCodexHook({
+    ...parent,
+    agent_id: 'child-agent',
+    prompt: '$stop-that-shit answer agents=0 -- child task'
+  }, { dataDir: directory });
+
+  const parentState = readState('parent-session', directory);
+  assert.equal(parentState.contract.mode, 'change');
+  assert.equal(parentState.contract.agentBudget, 6);
+  assert.deepEqual(parentState.contract.allowedPaths, ['src/**']);
+
+  const childState = readState('parent-session', directory, { agentId: 'child-agent' });
+  assert.equal(childState.contract.mode, 'answer');
+  assert.equal(childState.contract.agentBudget, 0);
+  assert.equal(childState.contract.allowedPaths, null);
+  assert.ok(fs.existsSync(childStatePath('parent-session', 'child-agent', directory)));
+  const status = handleCodexHook({ ...parent, agent_id: 'child-agent',
+    prompt: '$stop-that-shit status' }, { dataDir: directory });
+  assert.match(status.hookSpecificOutput.additionalContext, /files=src\/\*\*/);
+});
+
+test('a parent message can adjust a child contract without changing the parent', (t) => {
+  const directory = dataDir(t);
+  const parent = {
+    session_id: 'adjust-parent',
+    hook_event_name: 'UserPromptSubmit'
+  };
+  handleCodexHook({
+    ...parent,
+    prompt: '$stop-that-shit change agents=6 -- parent task'
+  }, { dataDir: directory });
+  handleCodexHook({
+    ...parent,
+    agent_id: 'child-agent',
+    prompt: '$stop-that-shit answer agents=0 -- first child request'
+  }, { dataDir: directory });
+  handleCodexHook({
+    ...parent,
+    agent_id: 'child-agent',
+    prompt: '$stop-that-shit change agents=2 -- second child request'
+  }, { dataDir: directory });
+
+  assert.equal(readState('adjust-parent', directory).contract.agentBudget, 6);
+  assert.equal(readState('adjust-parent', directory).contract.mode, 'change');
+  const child = readState('adjust-parent', directory, { agentId: 'child-agent' });
+  assert.equal(child.contract.mode, 'change');
+  assert.equal(child.contract.agentBudget, 2);
+});
+
+test('subagent stop and parent end preserve child state with unresolved descendants', (t) => {
+  const directory = dataDir(t);
+  const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'cleanup-parent' };
+  const parent = {
+    session_id: 'cleanup-parent',
+    hook_event_name: 'UserPromptSubmit'
+  };
+  handleCodexHook({
+    ...parent,
+    prompt: '$stop-that-shit change agents=6 -- parent task'
+  }, { dataDir: directory });
+  handleCodexHook({
+    ...parent,
+    agent_id: 'child-agent',
+    prompt: '$stop-that-shit answer agents=0 -- child task'
+  }, { dataDir: directory });
+  handleCodexHook({
+    session_id: 'cleanup-parent',
+    hook_event_name: 'PostToolUse',
+    agent_id: 'child-agent',
+    tool_name: 'spawn_agent',
+    tool_use_id: 'spawn-child',
+    tool_response: { agent_id: '00000000-0000-4000-8000-000000000001' }
+  }, { dataDir: directory });
+
+  assert.ok(fs.existsSync(childStatePath('cleanup-parent', 'child-agent', directory)));
+  handleCodexHook({
+    session_id: 'cleanup-parent',
+    hook_event_name: 'SessionEnd',
+    reason: 'other'
+  }, { dataDir: directory });
+  assert.ok(fs.existsSync(childStatePath('cleanup-parent', 'child-agent', directory)));
+
+  handleControlEvent({ ...base, kind: 'subagent.start', agentId: 'child-agent' }, { dataDir: directory });
+  handleControlEvent({ ...base, kind: 'subagent.stop', agentId: 'child-agent' }, { dataDir: directory });
+  handleControlEvent({ ...base, kind: 'session.end' }, { dataDir: directory });
+  assert.equal(fs.existsSync(childStatePath('cleanup-parent', 'child-agent', directory)), true);
+});
+
+test('a child file boundary can be narrowed but cannot be widened by its prompt', (t) => {
+  const directory = dataDir(t);
+  const parent = {
+    session_id: 'child-files',
+    hook_event_name: 'UserPromptSubmit'
+  };
+  handleCodexHook({
+    ...parent,
+    prompt: '$stop-that-shit lock change files=src/**|docs/** -- parent task'
+  }, { dataDir: directory });
+  handleCodexHook({
+    ...parent,
+    agent_id: 'child-agent',
+    prompt: '$stop-that-shit change files=src/config.cjs -- child task'
+  }, { dataDir: directory });
+  assert.deepEqual(readState('child-files', directory, { agentId: 'child-agent' }).contract.allowedPaths,
+    ['src/config.cjs']);
+
+  const widened = handleCodexHook({
+    ...parent,
+    agent_id: 'child-agent',
+    prompt: '$stop-that-shit change files=test/** -- child tries to widen'
+  }, { dataDir: directory });
+  assert.equal(widened.decision, 'block');
+  assert.match(widened.reason, /FILE_BOUNDARY_WIDEN/);
+  assert.deepEqual(readState('child-files', directory, { agentId: 'child-agent' }).contract.allowedPaths,
+    ['src/config.cjs']);
+});
+
+test('a child action before its first prompt inherits parent authority', (t) => {
+  const directory = dataDir(t);
+  const session_id = 'child-before-prompt';
+  handleCodexHook({
+    session_id, hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit lock review files=src/** -- inspect'
+  }, { dataDir: directory });
+
+  const denied = handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'PreToolUse',
+    tool_name: 'apply_patch', tool_use_id: 'write-1',
+    tool_input: { patch: '*** Begin Patch\n*** Update File: src/a.cjs\n@@\n-old\n+new\n*** End Patch' }
+  }, { dataDir: directory });
+  assert.match(denied?.hookSpecificOutput?.permissionDecisionReason, /MODE_FORBIDS_MUTATION/);
+  assert.equal(handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'PreToolUse',
+    tool_name: 'Bash', tool_use_id: 'read-1', tool_input: { command: 'git status --short' }
+  }, { dataDir: directory }), null);
+});
+
+test('a child prompt cannot promote inherited parent authority', (t) => {
+  const directory = dataDir(t);
+  const session_id = 'child-promotion';
+  handleCodexHook({
+    session_id, hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit lock review files=src/** -- inspect'
+  }, { dataDir: directory });
+  handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit change hash=allow deps=allow agents=2 -- work'
+  }, { dataDir: directory });
+
+  const child = readState(session_id, directory, { agentId: 'child-agent' });
+  assert.equal(child.contract.mode, 'change');
+  assert.equal(child.contract.hashPolicy, 'allow');
+  assert.equal(child.contract.dependencyPolicy, 'allow');
+  assert.equal(child.contract.allowedPaths, null);
+  const denied = handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'PreToolUse',
+    tool_name: 'apply_patch', tool_use_id: 'write-1',
+    tool_input: { patch: '*** Begin Patch\n*** Update File: src/a.cjs\n@@\n-old\n+new\n*** End Patch' }
+  }, { dataDir: directory });
+  assert.match(denied?.hookSpecificOutput?.permissionDecisionReason, /MODE_FORBIDS_MUTATION/);
+});
+
+test('later parent restrictions apply to an existing child without erasing narrower limits', (t) => {
+  const directory = dataDir(t);
+  const session_id = 'parent-restricts-child';
+  handleCodexHook({
+    session_id, hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit lock change files=src/** agents=4 hash=allow deps=allow -- work'
+  }, { dataDir: directory });
+  handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit change files=src/config.cjs agents=1 hash=deny deps=deny -- child work'
+  }, { dataDir: directory });
+  handleCodexHook({
+    session_id, hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit lock review files=src/** agents=2 hash=ask deps=ask -- inspect'
+  }, { dataDir: directory });
+
+  const denied = handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'PreToolUse',
+    tool_name: 'apply_patch', tool_use_id: 'write-1',
+    tool_input: { patch: '*** Begin Patch\n*** Update File: src/config.cjs\n@@\n-old\n+new\n*** End Patch' }
+  }, { dataDir: directory });
+  assert.match(denied?.hookSpecificOutput?.permissionDecisionReason, /MODE_FORBIDS_MUTATION/);
+
+  const status = handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit status'
+  }, { dataDir: directory });
+  const text = status.hookSpecificOutput.additionalContext;
+  assert.match(text, /mode=review/);
+  assert.match(text, /agents=0\/1 reserved/);
+  assert.match(text, /hash=deny/);
+  assert.match(text, /deps=deny/);
+  assert.match(text, /files=src\/config\.cjs/);
+});
+
+test('a child without its own restriction follows a later parent relaxation', (t) => {
+  const directory = dataDir(t);
+  const session_id = 'parent-relaxes-child';
+  handleCodexHook({
+    session_id, hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit lock review files=src/** -- inspect'
+  }, { dataDir: directory });
+  handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'PreToolUse',
+    tool_name: 'Bash', tool_use_id: 'read-1', tool_input: { command: 'git status --short' }
+  }, { dataDir: directory });
+  handleCodexHook({
+    session_id, hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit lock change files=src/** -- work'
+  }, { dataDir: directory });
+
+  assert.equal(handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'PreToolUse',
+    tool_name: 'apply_patch', tool_use_id: 'write-1',
+    tool_input: { patch: '*** Begin Patch\n*** Update File: src/a.cjs\n@@\n-old\n+new\n*** End Patch' }
+  }, { dataDir: directory }), null);
+});
+
+test('a child prompt does not persist inherited restrictions before parent relaxation', (t) => {
+  const directory = dataDir(t);
+  const session_id = 'prompt-then-relax';
+  handleCodexHook({ session_id, hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit lock review files=src/** -- inspect' }, { dataDir: directory });
+  handleCodexHook({ session_id, agent_id: 'child-agent', hook_event_name: 'UserPromptSubmit',
+    prompt: 'Continue the assigned task.' }, { dataDir: directory });
+  assert.equal(readState(session_id, directory, { agentId: 'child-agent' }).contract.mode, 'unconfirmed');
+  handleCodexHook({ session_id, hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit lock change files=src/** -- work' }, { dataDir: directory });
+  assert.equal(handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'PreToolUse',
+    tool_name: 'apply_patch', tool_use_id: 'write-1',
+    tool_input: { patch: '*** Begin Patch\n*** Update File: src/a.cjs\n@@\n-old\n+new\n*** End Patch' }
+  }, { dataDir: directory }), null);
+});
+
+test('a child delegation update does not persist inherited restrictions before parent relaxation', (t) => {
+  const directory = dataDir(t);
+  const session_id = 'delegate-then-relax';
+  handleCodexHook({ session_id, hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit lock review agents=0 -- inspect' }, { dataDir: directory });
+  const denied = handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'PreToolUse',
+    tool_name: 'spawn_agent', tool_use_id: 'spawn-1', tool_input: { message: 'Inspect' }
+  }, { dataDir: directory });
+  assert.match(denied?.hookSpecificOutput?.permissionDecisionReason, /AGENT_BUDGET_EXHAUSTED/);
+  assert.equal(readState(session_id, directory, { agentId: 'child-agent' }).contract.mode, 'unconfirmed');
+  handleCodexHook({ session_id, hook_event_name: 'UserPromptSubmit',
+    prompt: '$stop-that-shit lock change agents=1 -- work' }, { dataDir: directory });
+  assert.equal(handleCodexHook({
+    session_id, agent_id: 'child-agent', hook_event_name: 'PreToolUse',
+    tool_name: 'spawn_agent', tool_use_id: 'spawn-2', tool_input: { message: 'Inspect' }
+  }, { dataDir: directory }), null);
+});
+
+test('Codex Adapter marks only high-confidence hashing actions', () => {
+  const hashPatch = toControlEvent({
+    session_id: 'session-1', hook_event_name: 'PreToolUse', tool_name: 'apply_patch',
+    tool_input: { patch: "*** Begin Patch\n+const digest = createHash('sha256').update(data).digest('hex');\n*** End Patch" }
+  });
+  const prosePatch = toControlEvent({
+    session_id: 'session-1', hook_event_name: 'PreToolUse', tool_name: 'apply_patch',
+    tool_input: { patch: '*** Begin Patch\n+Document the hash policy without adding code.\n*** End Patch' }
+  });
+  assert.equal(hashPatch.action.hashIntent, true);
+  assert.equal(prosePatch.action.hashIntent, false);
+});
+
+test('Codex Adapter extracts a patch path without guessing its semantics', () => {
+  const event = toControlEvent({
+    session_id: 'session-1', hook_event_name: 'PreToolUse', tool_name: 'apply_patch',
+    tool_input: {
+      patch: "*** Begin Patch\n*** Add File: src/legacy-adapter.cjs\n+function migrateLegacyConfig(value) { return value; }\n*** End Patch"
+    }
+  });
+  assert.deepEqual(event.action.affectedPaths, ['src/legacy-adapter.cjs']);
+  assert.equal(event.action.dependencyIntent, false);
+});
+
+test('dependency intent is scoped to added lines in manifest sections', () => {
+  const unrelated = `*** Begin Patch
+*** Update File: package.json
+@@
+-  "description": "old"
++  "description": "new"
+*** Update File: src/report.cjs
+@@
++const dependencies = { status: 'reported' };
+*** End Patch`;
+  assert.equal(detectDependencyIntent('apply_patch', { patch: unrelated }), false);
+
+  const dependency = `*** Begin Patch
+*** Update File: package.json
+@@
++  "dependencies": { "example": "^1.0.0" }
+*** End Patch`;
+  assert.equal(detectDependencyIntent('apply_patch', { patch: dependency }), true);
+});
+
+test('Codex Adapter normalizes an absolute patch path relative to hook cwd', () => {
+  const cwd = process.platform === 'win32' ? 'D:\\fixture' : '/fixture';
+  const absolute = process.platform === 'win32' ? 'D:\\fixture\\src\\config.cjs' : '/fixture/src/config.cjs';
+  const event = toControlEvent({
+    session_id: 'session-1', hook_event_name: 'PreToolUse', cwd, tool_name: 'apply_patch',
+    tool_input: { patch: `*** Begin Patch\n*** Update File: ${absolute}\n@@\n-old\n+new\n*** End Patch` }
+  });
+  assert.deepEqual(event.action.affectedPaths, ['src/config.cjs']);
+  assert.equal(event.action.cwd, cwd);
+});
+
+test('controller decisions do not depend on model metadata', (t) => {
+  const firstDir = dataDir(t);
+  const secondDir = dataDir(t);
+  const promptEvent = {
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2,
+    kind: 'prompt.submit',
+    sessionId: 'session-1',
+    turnId: 'turn-1',
+    prompt: '$stop-that-shit review -- inspect only'
+  };
+  handleControlEvent({ ...promptEvent, host: { family: 'codex', model: 'gpt-a' } }, { dataDir: firstDir });
+  handleControlEvent({ ...promptEvent, host: { family: 'future-host', model: 'model-b' } }, { dataDir: secondDir });
+
+  const action = {
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2,
+    kind: 'action.before',
+    sessionId: 'session-1',
+    turnId: 'turn-1',
+    action: { name: 'write-file', input: { path: 'x' }, mutability: 'write' }
+  };
+  const first = handleControlEvent({ ...action, host: { family: 'codex', model: 'gpt-a' } }, { dataDir: firstDir });
+  const second = handleControlEvent({ ...action, host: { family: 'future-host', model: 'model-b' } }, { dataDir: secondDir });
+  assert.deepEqual(first.decision, second.decision);
+  assert.equal(first.kind, second.kind);
+  assert.match(first.eventId, /^evt_/);
+  assert.match(second.eventId, /^evt_/);
+  assert.notEqual(first.eventId, second.eventId);
+  assert.equal(first.message.replace(first.eventId, '<event>'), second.message.replace(second.eventId, '<event>'));
+  assert.equal(first.kind, 'deny');
+  assert.equal(readRuntime({ sessionId: 'session-1' }, { dataDir: firstDir }).events[0].decision.responseOutcome, 'permission_deny_returned');
+  assert.equal(readRuntime({ sessionId: 'session-1' }, { dataDir: secondDir }).events[0].decision.responseOutcome, 'permission_deny_returned');
+});
+
+test('protocol rejects unknown versions and kinds', () => {
+  assert.throws(() => assertControlEvent({ protocolVersion: 99, kind: 'prompt.submit', sessionId: 's', prompt: '' }), /protocolVersion/);
+  assert.throws(() => assertControlEvent({ protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, kind: 'model.changed', sessionId: 's' }), /kind/);
+});
+
+test('protocol accepts only non-negative integer delegation counts', () => {
+  const event = {
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2,
+    kind: 'action.before',
+    sessionId: 'session-1',
+    action: { id: 'delegate-call', name: 'delegate_task', input: {}, mutability: 'delegate' }
+  };
+  assert.doesNotThrow(() => assertControlEvent(event));
+  assert.doesNotThrow(() => assertControlEvent({
+    ...event,
+    action: { ...event.action, delegationCount: 0 }
+  }));
+  assert.doesNotThrow(() => assertControlEvent({
+    ...event,
+    action: { ...event.action, delegationCount: 2, asyncLaunched: false }
+  }));
+  assert.doesNotThrow(() => assertControlEvent({
+    ...event,
+    action: { ...event.action, asyncLaunched: true }
+  }));
+  assert.throws(() => assertControlEvent({
+    ...event,
+    action: { ...event.action, asyncLaunched: 'true' }
+  }), /asyncLaunched/);
+  for (const delegationCount of [-1, 1.5, '2']) {
+    assert.throws(() => assertControlEvent({
+      ...event,
+      action: { ...event.action, delegationCount }
+    }), /delegationCount/);
+  }
+});
+
+test('protocol accepts only non-empty delegation target identifiers', () => {
+  const event = {
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2,
+    kind: 'action.before',
+    sessionId: 'session-1',
+    action: { name: 'send_input', mutability: 'control', delegationTargetId: 'agent-1' }
+  };
+  assert.doesNotThrow(() => assertControlEvent(event));
+  for (const delegationTargetId of [null, '', '   ', 42]) {
+    assert.throws(() => assertControlEvent({
+      ...event,
+      action: { ...event.action, delegationTargetId }
+    }), /delegationTargetId/);
+  }
+});
+
+test('protocol requires action identifiers only for delegation before-events', () => {
+  assert.doesNotThrow(() => assertControlEvent({
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2,
+    kind: 'action.before',
+    sessionId: 'session-1',
+    action: { name: 'write-file', mutability: 'write' }
+  }));
+
+  for (const id of [undefined, null, '', '   ', 42]) {
+    assert.throws(() => assertControlEvent({
+      protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2,
+      kind: 'action.before',
+      sessionId: 'session-1',
+      action: { id, name: 'delegate_task', mutability: 'delegate', delegationCount: 1 }
+    }), /action\.id/);
+  }
+
+  assert.doesNotThrow(() => assertControlEvent({
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2,
+    kind: 'action.before',
+    sessionId: 'session-1',
+    action: { id: 'delegate-call', name: 'delegate_task', mutability: 'delegate', delegationCount: 1 }
+  }));
+});
+
+test('protocol accepts lifecycle events and action identifiers', () => {
+  assert.doesNotThrow(() => assertControlEvent({
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2,
+    kind: 'action.after',
+    sessionId: 'session-1',
+    action: { id: 'call-1', agentId: 'agent-1' }
+  }));
+  assert.doesNotThrow(() => assertControlEvent({
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2,
+    kind: 'subagent.start',
+    sessionId: 'session-1',
+    agentId: 'agent-1',
+    reservationId: 'reservation-1'
+  }));
+  assert.doesNotThrow(() => assertControlEvent({
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2,
+    kind: 'subagent.stop',
+    sessionId: 'session-1',
+    agentId: 'agent-1'
+  }));
+  assert.doesNotThrow(() => assertControlEvent({
+    protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2,
+    kind: 'session.end',
+    sessionId: 'session-1'
+  }));
+});
+
+test('controller applies the active agent limit atomically', (t) => {
+  const directory = dataDir(t);
+  const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'ledger-session' };
+  handleControlEvent({
+    ...base,
+    kind: 'prompt.submit',
+    prompt: '$stop-that-shit change agents=2 -- delegate'
+  }, { dataDir: directory });
+
+  const first = handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-1', name: 'delegate_task', mutability: 'delegate', delegationCount: 2, asyncLaunched: false }
+  }, { dataDir: directory });
+  assert.equal(first.kind, 'none');
+  assert.equal(readState('ledger-session', directory).delegation.reservations['reservation:call-1'].pendingCount, 2);
+
+  const concurrentDenied = handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-2', name: 'delegate_task', mutability: 'delegate', delegationCount: 1, asyncLaunched: false }
+  }, { dataDir: directory });
+  assert.equal(concurrentDenied.decision.reasonCode, 'AGENT_BUDGET_EXHAUSTED');
+
+  handleControlEvent({ ...base, kind: 'action.after', action: { id: 'call-1', completed: true } }, { dataDir: directory });
+  const lastUnit = handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-3', name: 'delegate_task', mutability: 'delegate', delegationCount: 1, asyncLaunched: false }
+  }, { dataDir: directory });
+  assert.equal(lastUnit.kind, 'none');
+
+  const batchDenied = handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-4', name: 'delegate_task', mutability: 'delegate', delegationCount: 1, asyncLaunched: false }
+  }, { dataDir: directory });
+  assert.equal(batchDenied.kind, 'none');
+
+  const overLimit = handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-5', name: 'delegate_task', mutability: 'delegate', delegationCount: 2, asyncLaunched: false }
+  }, { dataDir: directory });
+  assert.equal(overLimit.decision.reasonCode, 'AGENT_BUDGET_EXHAUSTED');
+});
+
+test('subagent start and stop events are idempotent and synchronous action.after releases work', (t) => {
+  const directory = dataDir(t);
+  const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'lifecycle-session' };
+  handleControlEvent({ ...base, kind: 'prompt.submit', prompt: '$stop-that-shit change agents=2 -- delegate' }, { dataDir: directory });
+  handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-1', name: 'delegate_task', mutability: 'delegate', delegationCount: 2, asyncLaunched: false }
+  }, { dataDir: directory });
+
+  handleControlEvent({ ...base, kind: 'subagent.start', agentId: 'agent-1', reservationId: 'reservation:call-1' }, { dataDir: directory });
+  handleControlEvent({ ...base, kind: 'subagent.start', agentId: 'agent-1', reservationId: 'reservation:call-1' }, { dataDir: directory });
+  assert.equal(readState('lifecycle-session', directory).delegation.reservations['reservation:call-1'].pendingCount, 1);
+  handleControlEvent({ ...base, kind: 'subagent.stop', agentId: 'agent-1' }, { dataDir: directory });
+  handleControlEvent({ ...base, kind: 'subagent.stop', agentId: 'agent-1' }, { dataDir: directory });
+  assert.equal(readState('lifecycle-session', directory).delegation.reservations['reservation:call-1'].pendingCount, 1);
+  handleControlEvent({ ...base, kind: 'action.after', action: { id: 'call-1', completed: true } }, { dataDir: directory });
+  handleControlEvent({ ...base, kind: 'action.after', action: { id: 'call-1', completed: true } }, { dataDir: directory });
+  assert.equal(Object.keys(readState('lifecycle-session', directory).delegation.reservations).length, 0);
+
+  handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-2', name: 'delegate_task', mutability: 'delegate', delegationCount: 1, asyncLaunched: false }
+  }, { dataDir: directory });
+  handleControlEvent({ ...base, kind: 'subagent.start', agentId: 'agent-1' }, { dataDir: directory });
+  handleControlEvent({ ...base, kind: 'subagent.stop', agentId: 'agent-1' }, { dataDir: directory });
+  assert.equal(readState('lifecycle-session', directory).delegation.reservations['reservation:call-2'].pendingCount, 1);
+  handleControlEvent({ ...base, kind: 'action.after', action: { id: 'call-2', completed: true } }, { dataDir: directory });
+});
+
+test('late duplicate starts cannot release another pending agent slot', (t) => {
+  const directory = dataDir(t);
+  const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'late-start-session' };
+  handleControlEvent({ ...base, kind: 'prompt.submit', prompt: '$stop-that-shit change agents=2 -- delegate' }, { dataDir: directory });
+  handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-1', name: 'delegate_task', mutability: 'delegate', delegationCount: 2, asyncLaunched: true }
+  }, { dataDir: directory });
+
+  handleControlEvent({ ...base, kind: 'subagent.stop', agentId: 'agent-a' }, { dataDir: directory });
+  handleControlEvent({ ...base, kind: 'subagent.start', agentId: 'agent-a', reservationId: 'reservation:call-1' }, { dataDir: directory });
+  const duplicate = handleControlEvent({
+    ...base,
+    kind: 'subagent.start',
+    agentId: 'agent-a',
+    reservationId: 'reservation:call-1'
+  }, { dataDir: directory });
+
+  assert.ok(duplicate);
+  const state = readState('late-start-session', directory);
+  assert.equal(state.delegation.reservations['reservation:call-1'].pendingCount, 1);
+  assert.equal(state.delegation.reservations['reservation:call-1'].agentIds.length, 0);
+});
+
+test('asynchronous action.after retains activity until explicit agent stops', (t) => {
+  const directory = dataDir(t);
+  const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'async-lifecycle-session' };
+  handleControlEvent({ ...base, kind: 'prompt.submit', prompt: '$stop-that-shit change agents=1 -- delegate' }, { dataDir: directory });
+  handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-1', name: 'delegate_task', mutability: 'delegate', delegationCount: 1, asyncLaunched: true }
+  }, { dataDir: directory });
+  handleControlEvent({ ...base, kind: 'action.after', action: { id: 'call-1', asyncLaunched: true } }, { dataDir: directory });
+
+  const denied = handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-2', name: 'delegate_task', mutability: 'delegate', delegationCount: 1, asyncLaunched: true }
+  }, { dataDir: directory });
+  assert.equal(denied.decision.reasonCode, 'AGENT_BUDGET_EXHAUSTED');
+
+  handleControlEvent({ ...base, kind: 'subagent.start', agentId: 'agent-1', reservationId: 'reservation:call-1' }, { dataDir: directory });
+  handleControlEvent({ ...base, kind: 'subagent.stop', agentId: 'agent-1' }, { dataDir: directory });
+  const allowed = handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-3', name: 'delegate_task', mutability: 'delegate', delegationCount: 1, asyncLaunched: false }
+  }, { dataDir: directory });
+  assert.equal(allowed.kind, 'none');
+});
+
+test('subagent start requires an explicit reservation and does not use FIFO pairing', (t) => {
+  const directory = dataDir(t);
+  const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'out-of-order-session' };
+  handleControlEvent({ ...base, kind: 'prompt.submit', prompt: '$stop-that-shit change agents=2 -- delegate' }, { dataDir: directory });
+  for (const id of ['call-a', 'call-b']) {
+    handleControlEvent({
+      ...base,
+      kind: 'action.before',
+      action: { id, name: 'delegate_task', mutability: 'delegate', delegationCount: 1, asyncLaunched: true }
+    }, { dataDir: directory });
+  }
+
+  handleControlEvent({ ...base, kind: 'subagent.start', agentId: 'agent-b', reservationId: 'reservation:call-b' }, { dataDir: directory });
+  handleControlEvent({ ...base, kind: 'subagent.start', agentId: 'agent-a', reservationId: 'reservation:call-a' }, { dataDir: directory });
+  const state = readState('out-of-order-session', directory);
+  assert.deepEqual(state.delegation.reservations['reservation:call-a'].agentIds, ['agent-a']);
+  assert.deepEqual(state.delegation.reservations['reservation:call-b'].agentIds, ['agent-b']);
+
+  handleControlEvent({ ...base, kind: 'subagent.start', agentId: 'agent-unmatched' }, { dataDir: directory });
+  const unchanged = readState('out-of-order-session', directory);
+  assert.deepEqual(unchanged.delegation.reservations['reservation:call-a'].agentIds, ['agent-a']);
+  assert.deepEqual(unchanged.delegation.reservations['reservation:call-b'].agentIds, ['agent-b']);
+});
+
+test('each delegation execution needs a fresh id while duplicate completion remains harmless', (t) => {
+  const directory = dataDir(t);
+  const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'replay-session' };
+  handleControlEvent({ ...base, kind: 'prompt.submit', prompt: '$stop-that-shit change agents=2 -- delegate' }, { dataDir: directory });
+  const first = handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'replayed-call', name: 'delegate_task', mutability: 'delegate', delegationCount: 1, asyncLaunched: false }
+  }, { dataDir: directory });
+  assert.equal(first.kind, 'none');
+  const replay = () => handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'replayed-call', name: 'delegate_task', mutability: 'delegate', delegationCount: 1, asyncLaunched: false }
+  }, { dataDir: directory });
+  assert.equal(replay().decision.reasonCode, 'DUPLICATE_ACTION_ID');
+  handleControlEvent({ ...base, kind: 'action.after', action: { id: 'replayed-call', completed: true } }, { dataDir: directory });
+  assert.equal(replay().decision.reasonCode, 'DUPLICATE_ACTION_ID');
+  assert.equal(readState('replay-session', directory).delegation.acceptedActions['replayed-call'], 1);
+  const launch = id => handleControlEvent({ ...base, kind: 'action.before',
+    action: { id, name: 'delegate_task', mutability: 'delegate', delegationCount: 2 } }, { dataDir: directory });
+  assert.equal(launch('fresh-call').kind, 'none');
+  handleControlEvent({ ...base, kind: 'action.after', action: { id: 'replayed-call', completed: true } }, { dataDir: directory });
+  assert.equal(launch('over-budget').decision.reasonCode, 'AGENT_BUDGET_EXHAUSTED');
+
+  const conflict = handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'replayed-call', name: 'delegate_task', mutability: 'delegate', delegationCount: 2, asyncLaunched: false }
+  }, { dataDir: directory });
+  assert.equal(conflict.decision.reasonCode, 'DUPLICATE_ACTION_ID');
+});
+
+test('invalid current delegation state preserves the file and permits recovery reads only', t => {
+  const directory = dataDir(t);
+  const { statePath } = require('../src/state.cjs');
+  const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'ledger-damage' };
+  const call = (kind, fields) => handleControlEvent({ ...base, kind, ...fields }, { dataDir: directory });
+  call('prompt.submit', { prompt: '$stop-that-shit change agents=1' });
+  call('action.before', { action: { id: 'active', name: 'task', mutability: 'delegate' } });
+  const file = statePath(base.sessionId, directory);
+  const valid = fs.readFileSync(file, 'utf8');
+  const corruptions = [
+    state => { state.schemaVersion = '4'; },
+    state => { state.schemaVersion = 5; },
+    state => { delete state.delegation; },
+    state => { state.delegation.reservations = []; },
+    state => { state.delegation.reservations['reservation:active'].pendingCount = '1'; },
+    state => { delete state.delegation.reservations['reservation:active'].agentIds; },
+    state => { state.delegation.acceptedActions.active = null; },
+    state => { state.delegation.unresolved = { active: 42 }; }
+  ];
+  for (const corrupt of corruptions) {
+    const state = JSON.parse(valid); corrupt(state);
+    const raw = JSON.stringify(state); fs.writeFileSync(file, raw);
+    assert.equal(call('action.before', { action: { name: 'read', mutability: 'read' } }).kind, 'none');
+    const blocked = call('action.before', { action: { id: 'next', name: 'task', mutability: 'delegate' } });
+    assert.equal(blocked.decision.reasonCode, 'STATE_DAMAGED');
+    call('prompt.submit', { prompt: '$stop-that-shit change agents=2' });
+    assert.equal(fs.readFileSync(file, 'utf8'), raw);
+  }
+  fs.writeFileSync(file, valid);
+  assert.equal(call('action.before', { action: { id: 'next', name: 'task', mutability: 'delegate' } }).decision.reasonCode, 'AGENT_BUDGET_EXHAUSTED');
+  call('action.after', { action: { id: 'active', lifecycle: 'joined' } });
+  assert.equal(call('action.before', { action: { id: 'next', name: 'task', mutability: 'delegate' } }).kind, 'none');
+});
+
+test('formal agents directive clears an earlier split-directive error', (t) => {
+  const directory = dataDir(t);
+  const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'directive-session' };
+  const invalid = handleControlEvent({ ...base, kind: 'prompt.submit', prompt: '$stop-that-shit change total-agents=4 -- delegate' }, { dataDir: directory });
+  assert.equal(invalid.kind, 'prompt-error');
+  const valid = handleControlEvent({ ...base, kind: 'prompt.submit', prompt: '$stop-that-shit change agents=1 -- delegate' }, { dataDir: directory });
+  assert.notEqual(valid.kind, 'prompt-error');
+  assert.equal(readState('directive-session', directory).contract.agentBudget, 1);
+  assert.equal(readState('directive-session', directory).directiveError, null);
+  assert.equal(readState('directive-session', directory).directiveWarning, null);
+
+  const denied = handleControlEvent({
+    ...base,
+    kind: 'action.before',
+    action: { id: 'call-1', name: 'delegate_task', mutability: 'delegate', delegationCount: 1 }
+  }, { dataDir: directory });
+  assert.equal(denied.kind, 'none');
+});
+
+test('Codex Adapter renders a normalized deny result back to PreToolUse JSON', () => {
+  const output = fromControlResult('PreToolUse', {
+    kind: 'deny',
+    message: 'Stop That Shit [I/MODE_FORBIDS_MUTATION]: blocked'
+  });
+  assert.equal(output.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /MODE_FORBIDS_MUTATION/);
+});
+
+test('controller implementation contains no Codex Hook event names', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'controller.cjs'), 'utf8');
+  assert.doesNotMatch(source, /PreToolUse|PostToolUse|UserPromptSubmit|SubagentStart|hook_event_name/);
+});
+
+for (const directive of ['files=src/a.cjs', 'watch', 'off']) {
+  test(`child ${directive} preserves parent guard and permitted writes`, t => {
+    const directory = dataDir(t);
+    const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'child-fallback' };
+    const call = (kind, fields, child = true) => handleControlEvent({ ...base,
+      ...(child ? { agent: { agentId: 'child' } } : {}), kind, ...fields }, { dataDir: directory });
+    call('prompt.submit', { prompt: '$stop-that-shit change files=src/** deps=deny hash=deny agents=1' }, false);
+    call('prompt.submit', { prompt: `$stop-that-shit ${directive}` });
+    const write = path => call('action.before', { action: { name: 'write', mutability: 'write', affectedPaths: [path] } });
+    assert.equal(write('private/a.cjs').kind, 'deny');
+    assert.equal(write('src/a.cjs').kind, 'none');
+    assert.equal(call('action.before', { action: { name: 'install', mutability: 'write', affectedPaths: ['src/a.cjs'], dependencyIntent: true } }).kind, 'deny');
+    assert.equal(call('action.before', { action: { name: 'write', mutability: 'write', affectedPaths: ['src/a.cjs'], hashIntent: true } }).kind, 'deny');
+    const launch = id => call('action.before', { action: { id, name: 'spawn_agent', mutability: 'delegate' } });
+    assert.equal(launch('first').kind, 'none');
+    call('prompt.submit', { prompt: 'Continue.' });
+    call('prompt.submit', { prompt: '$stop-that-shit status' });
+    assert.equal(launch('second').decision.reasonCode, 'AGENT_BUDGET_EXHAUSTED');
+    call('action.after', { action: { id: 'first', lifecycle: 'joined' } });
+    assert.equal(launch('second').kind, 'none');
+    assert.equal(launch('first').decision.reasonCode, 'DUPLICATE_ACTION_ID');
+  });
+}
+
+test('child file traversal cannot widen scope while a normalized in-scope path completes', t => {
+  const directory = dataDir(t);
+  const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'child-paths' };
+  handleControlEvent({ ...base, kind: 'prompt.submit', prompt: '$stop-that-shit change files=src/**' }, { dataDir: directory });
+  const call = (kind, fields) => handleControlEvent({ ...base, agent: { agentId: 'child' }, kind, ...fields }, { dataDir: directory });
+  assert.equal(call('prompt.submit', { prompt: '$stop-that-shit change files=src/../private/**' }).kind, 'prompt-error');
+  assert.equal(call('action.before', { action: { name: 'write', mutability: 'write', affectedPaths: ['src/../private/a.cjs'] } }).kind, 'deny');
+  assert.notEqual(call('prompt.submit', { prompt: '$stop-that-shit change files=src/lib/../a.cjs' }).kind, 'prompt-error');
+  assert.equal(call('action.before', { action: { name: 'write', mutability: 'write', affectedPaths: ['src/a.cjs'] } }).kind, 'none');
+  assert.equal(call('action.before', { action: { name: 'write', mutability: 'write', affectedPaths: ['src/b.cjs'] } }).kind, 'deny');
+});
+
+test('a pristine child tracks parent dependency authorization without gaining independent authority', t => {
+  const directory = dataDir(t);
+  const base = { protocolVersion: PROTOCOL_VERSION, lifecycleVersion: 2, sessionId: 'pristine-inheritance' };
+  const prompt = text => handleControlEvent({ ...base, kind: 'prompt.submit', prompt: text }, { dataDir: directory });
+  const child = (kind, fields) => handleControlEvent({ ...base, agent: { agentId: 'child' }, kind, ...fields }, { dataDir: directory });
+  const install = () => child('action.before', { action: { name: 'install', mutability: 'write', dependencyIntent: true } });
+  prompt('$stop-that-shit change deps=deny');
+  assert.equal(install().kind, 'deny');
+  child('prompt.submit', { prompt: 'Continue the assigned task.' });
+  prompt('$stop-that-shit change deps=allow');
+  assert.equal(install().kind, 'none');
+  assert.equal(readState(base.sessionId, directory, { agentId: 'child' }).contract.source, 'default');
+  prompt('$stop-that-shit change deps=deny');
+  assert.equal(install().kind, 'deny');
+  prompt('$stop-that-shit change deps=allow');
+  child('prompt.submit', { prompt: '$stop-that-shit deps=deny' });
+  assert.equal(install().kind, 'deny');
+});
